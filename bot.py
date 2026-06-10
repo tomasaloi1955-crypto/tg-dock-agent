@@ -2,14 +2,14 @@
 TG Doc Agent — бесплатный ИИ-агент для генерации документов в Telegram.
 Форматы: PDF, DOCX, XLSX, CSV, TXT, PPTX.
 ИИ: Google Gemini (бесплатный tier).
-Хостинг: Render free tier (webhook-режим).
+Хостинг: Render free tier.
 """
 
-import os
+import asyncio
 import io
 import json
 import logging
-
+import os
 
 import requests
 from telegram import Update
@@ -24,7 +24,7 @@ log = logging.getLogger("doc-agent")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # https://<app>.onrender.com
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 PORT = int(os.environ.get("PORT", "10000"))
 
 TEMPLATES_FILE = "templates.json"
@@ -32,7 +32,7 @@ FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans.ttf")
 FONT_BOLD_PATH = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans-Bold.ttf")
 
 
-# ── Шаблоны (образцы юзеров) ──────────────────────────────────────────────
+# ── Шаблоны ───────────────────────────────────────────────────────────────
 def load_templates() -> dict:
     if os.path.exists(TEMPLATES_FILE):
         with open(TEMPLATES_FILE, encoding="utf-8") as f:
@@ -42,7 +42,7 @@ def load_templates() -> dict:
 
 def save_template(user_id: int, text: str):
     data = load_templates()
-    data[str(user_id)] = text[:8000]  # ограничим размер
+    data[str(user_id)] = text[:8000]
     with open(TEMPLATES_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
@@ -106,17 +106,14 @@ def plan_document(user_request: str, template: str) -> dict:
 # ── Генераторы файлов ─────────────────────────────────────────────────────
 def make_pdf(plan: dict) -> bytes:
     from fpdf import FPDF
-
     pdf = FPDF(format="A4")
     pdf.add_font("DejaVu", "", FONT_PATH)
     pdf.add_font("DejaVu", "B", FONT_BOLD_PATH)
     pdf.set_auto_page_break(auto=True, margin=20)
     pdf.add_page()
-
     pdf.set_font("DejaVu", "B", 18)
     pdf.multi_cell(0, 10, plan["title"], new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
-
     for block in plan["content"]:
         t = block["type"]
         if t == "heading":
@@ -136,7 +133,7 @@ def make_pdf(plan: dict) -> bytes:
         elif t == "checklist":
             pdf.set_font("DejaVu", "", 11)
             for item in block["items"]:
-                pdf.multi_cell(0, 7, f"  ☐  {item}", new_x="LMARGIN", new_y="NEXT")
+                pdf.multi_cell(0, 7, f"  [ ]  {item}", new_x="LMARGIN", new_y="NEXT")
             pdf.ln(2)
     return bytes(pdf.output())
 
@@ -144,7 +141,6 @@ def make_pdf(plan: dict) -> bytes:
 def make_docx(plan: dict) -> bytes:
     from docx import Document
     from docx.shared import Pt
-
     doc = Document()
     doc.add_heading(plan["title"], level=0)
     for block in plan["content"]:
@@ -159,7 +155,7 @@ def make_docx(plan: dict) -> bytes:
         elif t == "checklist":
             for item in block["items"]:
                 p = doc.add_paragraph()
-                run = p.add_run(f"☐  {item}")
+                run = p.add_run(f"[ ]  {item}")
                 run.font.size = Pt(11)
     buf = io.BytesIO()
     doc.save(buf)
@@ -169,7 +165,6 @@ def make_docx(plan: dict) -> bytes:
 def make_xlsx(plan: dict) -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
-
     wb = Workbook()
     ws = wb.active
     ws.title = plan["title"][:30]
@@ -190,13 +185,12 @@ def make_xlsx(plan: dict) -> bytes:
 
 def make_csv(plan: dict) -> bytes:
     import csv
-
     c = plan["content"]
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(c["headers"])
     w.writerows(c["rows"])
-    return buf.getvalue().encode("utf-8-sig")  # BOM, чтобы Excel понял кириллицу
+    return buf.getvalue().encode("utf-8-sig")
 
 
 def make_txt(plan: dict) -> bytes:
@@ -216,12 +210,9 @@ def make_txt(plan: dict) -> bytes:
 def make_pptx(plan: dict) -> bytes:
     from pptx import Presentation
     from pptx.util import Pt
-
     prs = Presentation()
-    # титульный слайд
     slide = prs.slides.add_slide(prs.slide_layouts[0])
     slide.shapes.title.text = plan["title"]
-
     for s in plan["content"]:
         slide = prs.slides.add_slide(prs.slide_layouts[1])
         slide.shapes.title.text = s["title"]
@@ -339,8 +330,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"Ошибка генерации 😞 Попробуй переформулировать.\n({e})")
 
 
-def main():
-
+# ── Запуск ────────────────────────────────────────────────────────────────
+async def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("template", cmd_template))
@@ -357,9 +348,9 @@ def main():
             webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
         )
     else:
-        log.info("Starting in POLLING mode (локальный запуск)")
+        log.info("Starting in POLLING mode")
         app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
