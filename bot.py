@@ -2,10 +2,8 @@
 TG Doc Agent — бесплатный ИИ-агент для генерации документов в Telegram.
 Форматы: PDF, DOCX, XLSX, CSV, TXT, PPTX.
 ИИ: Google Gemini (бесплатный tier).
-Хостинг: Render free tier.
 """
 
-import asyncio
 import io
 import json
 import logging
@@ -20,7 +18,6 @@ from telegram.ext import (
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("doc-agent")
 
-# ── Конфиг ────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
@@ -32,7 +29,6 @@ FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans.ttf")
 FONT_BOLD_PATH = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans-Bold.ttf")
 
 
-# ── Шаблоны ───────────────────────────────────────────────────────────────
 def load_templates() -> dict:
     if os.path.exists(TEMPLATES_FILE):
         with open(TEMPLATES_FILE, encoding="utf-8") as f:
@@ -51,7 +47,6 @@ def get_template(user_id: int) -> str:
     return load_templates().get(str(user_id), "")
 
 
-# ── Gemini ────────────────────────────────────────────────────────────────
 def gemini(prompt: str, system: str = "") -> str:
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -87,14 +82,14 @@ PLAN_SYSTEM = """Ты — генератор документов. Пользо�
 - xlsx/csv: {"headers":["..."],"rows":[["..."],["..."]]}
 - pptx: [{"title":"Заголовок слайда","bullets":["...","..."]}]
 
-Контент делай содержательным, полным и полезным — это готовый документ, а не черновик.
+Контент делай содержательным, полным и полезным.
 Если дан ОБРАЗЕЦ — точно копируй его структуру, стиль, тон и оформление."""
 
 
 def plan_document(user_request: str, template: str) -> dict:
     prompt = user_request
     if template:
-        prompt += f"\n\n--- ОБРАЗЕЦ ПОЛЬЗОВАТЕЛЯ (копируй структуру и стиль) ---\n{template}"
+        prompt += f"\n\n--- ОБРАЗЕЦ ПОЛЬЗОВАТЕЛЯ ---\n{template}"
     raw = gemini(prompt, PLAN_SYSTEM)
     raw = raw.strip()
     if raw.startswith("```"):
@@ -103,7 +98,6 @@ def plan_document(user_request: str, template: str) -> dict:
     return json.loads(raw.strip())
 
 
-# ── Генераторы файлов ─────────────────────────────────────────────────────
 def make_pdf(plan: dict) -> bytes:
     from fpdf import FPDF
     pdf = FPDF(format="A4")
@@ -155,8 +149,7 @@ def make_docx(plan: dict) -> bytes:
         elif t == "checklist":
             for item in block["items"]:
                 p = doc.add_paragraph()
-                run = p.add_run(f"[ ]  {item}")
-                run.font.size = Pt(11)
+                p.add_run(f"[ ]  {item}").font.size = Pt(11)
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
@@ -232,8 +225,6 @@ GENERATORS = {
     "csv": make_csv, "txt": make_txt, "pptx": make_pptx,
 }
 
-
-# ── Хэндлеры Telegram ─────────────────────────────────────────────────────
 START_TEXT = (
     "Привет! Я генерирую документы по твоему запросу 📄\n\n"
     "Просто напиши, что нужно, например:\n"
@@ -271,7 +262,7 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def extract_text_from_file(filename: str, data: bytes) -> str:
     name = filename.lower()
-    if name.endswith(".txt") or name.endswith(".md") or name.endswith(".csv"):
+    if name.endswith((".txt", ".md", ".csv")):
         return data.decode("utf-8", errors="ignore")
     if name.endswith(".docx"):
         from docx import Document
@@ -296,15 +287,10 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = bytes(await f.download_as_bytearray())
     text = extract_text_from_file(doc.file_name or "", data)
     if not text.strip():
-        await update.message.reply_text(
-            "Не смог прочитать файл 😕 Поддерживаю: .txt, .md, .docx, .pdf, .csv"
-        )
+        await update.message.reply_text("Не смог прочитать файл 😕 Поддерживаю: .txt, .md, .docx, .pdf, .csv")
         return
     save_template(update.effective_user.id, text)
-    await update.message.reply_text(
-        "Образец сохранён ✅ Теперь буду генерить документы в этом стиле.\n"
-        "Напиши, что создать!"
-    )
+    await update.message.reply_text("Образец сохранён ✅ Теперь буду генерить документы в этом стиле.\nНапиши, что создать!")
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -330,8 +316,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"Ошибка генерации 😞 Попробуй переформулировать.\n({e})")
 
 
-# ── Запуск ────────────────────────────────────────────────────────────────
-async def main():
+def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("template", cmd_template))
@@ -349,8 +334,8 @@ async def main():
         )
     else:
         log.info("Starting in POLLING mode")
-        app.run_polling()
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
