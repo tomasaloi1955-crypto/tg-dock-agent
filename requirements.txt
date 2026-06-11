@@ -1,4 +1,4 @@
-python-telegram-bot[webhooks]==21.10
+python-telegram-bot[webhooks]==20.7
 fpdf2==2.8.2
 python-docx==1.1.2
 openpyxl==3.1.5
