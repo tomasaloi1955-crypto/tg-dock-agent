@@ -23,6 +23,9 @@ from telegram.ext import (
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("doc-agent")
+# не светим токен в логах: глушим HTTP-логи библиотек
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
@@ -54,16 +57,29 @@ def get_template(user_id: int) -> str:
 
 
 def gemini(prompt: str, system: str = "") -> str:
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
-    )
+    import time
     body = {"contents": [{"parts": [{"text": prompt}]}]}
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
-    r = requests.post(url, json=body, timeout=120)
-    r.raise_for_status()
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    models = [GEMINI_MODEL, "gemini-2.0-flash-lite"]
+    last_err = None
+    for model in models:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={GEMINI_KEY}"
+        )
+        for attempt in range(2):
+            r = requests.post(url, json=body, timeout=120)
+            if r.status_code == 429:
+                last_err = "Лимит запросов Gemini (429)"
+                time.sleep(5)
+                continue
+            if r.status_code != 200:
+                # не включаем URL с ключом в текст ошибки
+                last_err = f"Gemini вернул {r.status_code}"
+                break
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    raise RuntimeError(last_err or "Gemini недоступен")
 
 
 PLAN_SYSTEM = """Ты — генератор документов. Пользователь пишет запрос на русском.
@@ -319,7 +335,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.delete()
     except Exception as e:
         log.exception("generation failed")
-        await status.edit_text(f"Ошибка генерации 😞 Попробуй переформулировать.\n({e})")
+        err = str(e)
+        if "key=" in err:  # на всякий случай вырезаем ключ из любых ошибок
+            err = err.split("key=")[0] + "key=***"
+        await status.edit_text(f"Ошибка генерации 😞 Попробуй ещё раз через минуту.\n({err[:200]})")
 
 
 def main():
