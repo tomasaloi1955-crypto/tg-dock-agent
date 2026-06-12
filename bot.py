@@ -28,8 +28,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -56,30 +58,67 @@ def get_template(user_id: int) -> str:
     return load_templates().get(str(user_id), "")
 
 
-def gemini(prompt: str, system: str = "") -> str:
+def call_groq(prompt: str, system: str) -> str:
+    r = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+        json={
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.7,
+        },
+        timeout=120,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Groq вернул {r.status_code}")
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def call_gemini(prompt: str, system: str) -> str:
     import time
     body = {"contents": [{"parts": [{"text": prompt}]}]}
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
-    models = [GEMINI_MODEL, "gemini-2.0-flash-lite"]
+    models = [GEMINI_MODEL, "gemini-2.0-flash-lite", "gemini-2.5-flash-lite"]
     last_err = None
     for model in models:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={GEMINI_KEY}"
+            f"{model}:generateContent"
         )
+        headers = {"x-goog-api-key": GEMINI_KEY}
         for attempt in range(2):
-            r = requests.post(url, json=body, timeout=120)
+            r = requests.post(url, json=body, headers=headers, timeout=120)
             if r.status_code == 429:
                 last_err = "Лимит запросов Gemini (429)"
                 time.sleep(5)
                 continue
             if r.status_code != 200:
-                # не включаем URL с ключом в текст ошибки
                 last_err = f"Gemini вернул {r.status_code}"
                 break
             return r.json()["candidates"][0]["content"]["parts"][0]["text"]
     raise RuntimeError(last_err or "Gemini недоступен")
+
+
+def llm(prompt: str, system: str = "") -> str:
+    """Пробуем провайдеров по очереди: Groq → Gemini."""
+    errors = []
+    if GROQ_KEY:
+        try:
+            return call_groq(prompt, system)
+        except Exception as e:
+            errors.append(str(e))
+            log.warning("Groq failed: %s", e)
+    if GEMINI_KEY:
+        try:
+            return call_gemini(prompt, system)
+        except Exception as e:
+            errors.append(str(e))
+            log.warning("Gemini failed: %s", e)
+    raise RuntimeError("; ".join(errors) or "Нет настроенных ИИ-провайдеров")
 
 
 PLAN_SYSTEM = """Ты — генератор документов. Пользователь пишет запрос на русском.
@@ -112,7 +151,7 @@ def plan_document(user_request: str, template: str) -> dict:
     prompt = user_request
     if template:
         prompt += f"\n\n--- ОБРАЗЕЦ ПОЛЬЗОВАТЕЛЯ ---\n{template}"
-    raw = gemini(prompt, PLAN_SYSTEM)
+    raw = llm(prompt, PLAN_SYSTEM)
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
