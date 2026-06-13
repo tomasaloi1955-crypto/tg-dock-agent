@@ -1,7 +1,7 @@
 """
-TG Doc Agent — бесплатный ИИ-агент для генерации документов в Telegram.
-Форматы: PDF, DOCX, XLSX, CSV, TXT, PPTX.
-ИИ: Google Gemini (бесплатный tier).
+TG Doc Agent v3 — красивые документы всех форматов со стилями.
+PDF, DOCX, XLSX, CSV, TXT, PPTX — у каждого 4 стиля.
+ИИ: Groq → Gemini fallback.
 """
 
 import io
@@ -9,21 +9,15 @@ import json
 import logging
 import os
 
-import asyncio as _asyncio
-try:
-    _asyncio.get_event_loop()
-except RuntimeError:
-    _asyncio.set_event_loop(_asyncio.new_event_loop())
-
 import requests
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters,
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
 )
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("doc-agent")
-# не светим токен в логах: глушим HTTP-логи библиотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -39,205 +33,364 @@ TEMPLATES_FILE = "templates.json"
 FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans.ttf")
 FONT_BOLD_PATH = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans-Bold.ttf")
 
+# ── Палитры стилей ────────────────────────────────────────────────────────
+STYLES = {
+    "minimal": {
+        "name": "🌊 Минимализм",
+        "bg": "F8F9FA", "header_bg": "212529", "header_fg": "FFFFFF",
+        "accent": "4ECDC4", "text": "212529", "subtext": "6C757D",
+        "row_alt": "F1F3F5",
+    },
+    "business": {
+        "name": "💎 Бизнес",
+        "bg": "1E2761", "header_bg": "0D1B4E", "header_fg": "CADCFC",
+        "accent": "F5A623", "text": "CADCFC", "subtext": "8FA8D8",
+        "row_alt": "253180",
+    },
+    "creative": {
+        "name": "🎨 Яркий",
+        "bg": "FFFFFF", "header_bg": "F96167", "header_fg": "FFFFFF",
+        "accent": "2F3C7E", "text": "2F3C7E", "subtext": "6B7280",
+        "row_alt": "FFF0F0",
+    },
+    "edu": {
+        "name": "🌍 Образование",
+        "bg": "FFFFFF", "header_bg": "028090", "header_fg": "FFFFFF",
+        "accent": "02C39A", "text": "2C3E50", "subtext": "7F8C8D",
+        "row_alt": "E8F8F5",
+    },
+}
 
-def load_templates() -> dict:
+
+def hex2rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+
+# ── Шаблоны ───────────────────────────────────────────────────────────────
+def load_templates():
     if os.path.exists(TEMPLATES_FILE):
         with open(TEMPLATES_FILE, encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
-def save_template(user_id: int, text: str):
+def save_template(user_id, text):
     data = load_templates()
     data[str(user_id)] = text[:8000]
     with open(TEMPLATES_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
 
-def get_template(user_id: int) -> str:
+def get_template(user_id):
     return load_templates().get(str(user_id), "")
 
 
-def call_groq(prompt: str, system: str) -> str:
+# ── LLM ───────────────────────────────────────────────────────────────────
+def call_groq(prompt, system):
     r = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_KEY}"},
-        json={
-            "model": GROQ_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.7,
-        },
+        json={"model": GROQ_MODEL, "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ], "temperature": 0.7},
         timeout=120,
     )
     if r.status_code != 200:
-        raise RuntimeError(f"Groq вернул {r.status_code}")
+        raise RuntimeError(f"Groq {r.status_code}")
     return r.json()["choices"][0]["message"]["content"]
 
 
-def call_gemini(prompt: str, system: str) -> str:
+def call_gemini(prompt, system):
     import time
     body = {"contents": [{"parts": [{"text": prompt}]}]}
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
-    models = [GEMINI_MODEL, "gemini-2.0-flash-lite", "gemini-2.5-flash-lite"]
-    last_err = None
-    for model in models:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent"
-        )
-        headers = {"x-goog-api-key": GEMINI_KEY}
-        for attempt in range(2):
-            r = requests.post(url, json=body, headers=headers, timeout=120)
+    for model in [GEMINI_MODEL, "gemini-2.0-flash-lite"]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for _ in range(2):
+            r = requests.post(url, json=body, headers={"x-goog-api-key": GEMINI_KEY}, timeout=120)
             if r.status_code == 429:
-                last_err = "Лимит запросов Gemini (429)"
-                time.sleep(5)
-                continue
-            if r.status_code != 200:
-                last_err = f"Gemini вернул {r.status_code}"
-                break
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    raise RuntimeError(last_err or "Gemini недоступен")
+                time.sleep(5); continue
+            if r.status_code == 200:
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            break
+    raise RuntimeError("Gemini недоступен")
 
 
-def llm(prompt: str, system: str = "") -> str:
-    """Пробуем провайдеров по очереди: Groq → Gemini."""
-    errors = []
+def llm(prompt, system=""):
     if GROQ_KEY:
-        try:
-            return call_groq(prompt, system)
-        except Exception as e:
-            errors.append(str(e))
-            log.warning("Groq failed: %s", e)
+        try: return call_groq(prompt, system)
+        except Exception as e: log.warning("Groq: %s", e)
     if GEMINI_KEY:
-        try:
-            return call_gemini(prompt, system)
-        except Exception as e:
-            errors.append(str(e))
-            log.warning("Gemini failed: %s", e)
-    raise RuntimeError("; ".join(errors) or "Нет настроенных ИИ-провайдеров")
+        try: return call_gemini(prompt, system)
+        except Exception as e: log.warning("Gemini: %s", e)
+    raise RuntimeError("Нет доступных ИИ-провайдеров")
 
 
-PLAN_SYSTEM = """Ты — генератор документов. Пользователь пишет запрос на русском.
-Твоя задача — вернуть ТОЛЬКО валидный JSON без markdown-обёрток:
+PLAN_SYSTEM = """Ты — генератор документов. Верни ТОЛЬКО валидный JSON без markdown-обёрток:
 {
- "format": "pdf" | "docx" | "xlsx" | "csv" | "txt" | "pptx",
- "filename": "короткое_имя_без_расширения",
- "title": "Заголовок документа",
+ "format": "pdf"|"docx"|"xlsx"|"csv"|"txt"|"pptx",
+ "filename": "короткое_имя",
+ "title": "Заголовок",
  "content": ...
 }
-
-Правила выбора format:
-- юзер сказал формат явно → используй его
-- презентация/слайды → pptx
-- таблица/данные/учёт → xlsx (или csv если просили csv)
-- гайд/чек-лист/инструкция/документ → pdf
-- если просили ворд/docx → docx
-- заметка/простой текст → txt
-
-Структура content по формату:
-- pdf/docx/txt: [{"type":"heading","text":"..."} | {"type":"paragraph","text":"..."} | {"type":"bullets","items":["...","..."]} | {"type":"checklist","items":["...","..."]}]
-- xlsx/csv: {"headers":["..."],"rows":[["..."],["..."]]}
-- pptx: [{"title":"Заголовок слайда","bullets":["...","..."]}]
-
-Контент делай содержательным, полным и полезным.
-Если дан ОБРАЗЕЦ — точно копируй его структуру, стиль, тон и оформление."""
+Формат: презентация/слайды→pptx, таблица/данные→xlsx/csv, гайд/чек-лист/инструкция→pdf, ворд→docx, текст→txt
+Content:
+- pdf/docx/txt: [{"type":"heading","text":"..."},{"type":"paragraph","text":"..."},{"type":"bullets","items":["..."]},{"type":"checklist","items":["..."]}]
+- xlsx/csv: {"headers":["..."],"rows":[["..."]]}
+- pptx: [{"title":"...","bullets":["...","..."]}]
+Делай контент содержательным и полным. Для pptx — минимум 5 слайдов.
+Если есть ОБРАЗЕЦ — копируй его структуру и стиль."""
 
 
-def plan_document(user_request: str, template: str) -> dict:
+def plan_document(user_request, template=""):
     prompt = user_request
     if template:
-        prompt += f"\n\n--- ОБРАЗЕЦ ПОЛЬЗОВАТЕЛЯ ---\n{template}"
-    raw = llm(prompt, PLAN_SYSTEM)
-    raw = raw.strip()
+        prompt += f"\n\n--- ОБРАЗЕЦ ---\n{template}"
+    raw = llm(prompt, PLAN_SYSTEM).strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         raw = raw[4:] if raw.startswith("json") else raw
     return json.loads(raw.strip())
 
 
-def make_pdf(plan: dict) -> bytes:
+# ── PDF со стилями ────────────────────────────────────────────────────────
+def make_pdf(plan, style_key="minimal"):
     from fpdf import FPDF
+    s = STYLES[style_key]
+    bg = hex2rgb(s["bg"])
+    hbg = hex2rgb(s["header_bg"])
+    hfg = hex2rgb(s["header_fg"])
+    acc = hex2rgb(s["accent"])
+    txt = hex2rgb(s["text"])
+    sub = hex2rgb(s["subtext"])
+
     pdf = FPDF(format="A4")
     pdf.add_font("DejaVu", "", FONT_PATH)
     pdf.add_font("DejaVu", "B", FONT_BOLD_PATH)
-    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.set_auto_page_break(auto=True, margin=22)
     pdf.add_page()
+
+    # Шапка — цветной блок на всю ширину
+    pdf.set_fill_color(*hbg)
+    pdf.rect(0, 0, 210, 28, "F")
     pdf.set_font("DejaVu", "B", 18)
-    pdf.multi_cell(0, 10, plan["title"], new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
+    pdf.set_text_color(*hfg)
+    pdf.set_xy(10, 6)
+    pdf.cell(190, 16, plan["title"], align="L")
+
+    # Цветная линия-разделитель под шапкой
+    pdf.set_fill_color(*acc)
+    pdf.rect(0, 28, 210, 3, "F")
+    pdf.ln(10)
+
     for block in plan["content"]:
         t = block["type"]
         if t == "heading":
-            pdf.set_font("DejaVu", "B", 14)
             pdf.ln(3)
-            pdf.multi_cell(0, 8, block["text"], new_x="LMARGIN", new_y="NEXT")
+            # Акцентная полоска слева
+            pdf.set_fill_color(*acc)
+            pdf.rect(10, pdf.get_y(), 4, 9, "F")
+            pdf.set_font("DejaVu", "B", 13)
+            pdf.set_text_color(*txt)
+            pdf.set_x(17)
+            pdf.multi_cell(180, 9, block["text"], new_x="LMARGIN", new_y="NEXT")
             pdf.ln(1)
+
         elif t == "paragraph":
             pdf.set_font("DejaVu", "", 11)
-            pdf.multi_cell(0, 6, block["text"], new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(*txt)
+            pdf.set_x(10)
+            pdf.multi_cell(190, 6, block["text"], new_x="LMARGIN", new_y="NEXT")
             pdf.ln(2)
+
         elif t == "bullets":
             pdf.set_font("DejaVu", "", 11)
+            pdf.set_text_color(*txt)
             for item in block["items"]:
-                pdf.multi_cell(0, 6, f"  •  {item}", new_x="LMARGIN", new_y="NEXT")
+                # Цветная точка
+                pdf.set_fill_color(*acc)
+                pdf.rect(12, pdf.get_y() + 2, 3, 3, "F")
+                pdf.set_x(18)
+                pdf.multi_cell(182, 6, item, new_x="LMARGIN", new_y="NEXT")
             pdf.ln(2)
+
         elif t == "checklist":
             pdf.set_font("DejaVu", "", 11)
+            pdf.set_text_color(*txt)
             for item in block["items"]:
-                pdf.multi_cell(0, 7, f"  [ ]  {item}", new_x="LMARGIN", new_y="NEXT")
+                # Квадратик-чекбокс
+                pdf.set_draw_color(*acc)
+                pdf.set_line_width(0.5)
+                pdf.rect(12, pdf.get_y() + 1, 4, 4)
+                pdf.set_x(19)
+                pdf.multi_cell(181, 6, item, new_x="LMARGIN", new_y="NEXT")
             pdf.ln(2)
+
+    # Подвал
+    pdf.set_y(-15)
+    pdf.set_font("DejaVu", "", 8)
+    pdf.set_text_color(*sub)
+    pdf.set_fill_color(*hbg)
+    pdf.rect(0, pdf.get_y() - 2, 210, 20, "F")
+    pdf.set_text_color(*hfg)
+    pdf.cell(0, 8, plan["title"], align="C")
+
     return bytes(pdf.output())
 
 
-def make_docx(plan: dict) -> bytes:
+# ── DOCX со стилями ───────────────────────────────────────────────────────
+def make_docx(plan, style_key="minimal"):
     from docx import Document
-    from docx.shared import Pt
+    from docx.shared import Pt, RGBColor as DRGBColor, Inches, Cm
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    import lxml.etree as etree
+
+    s = STYLES[style_key]
+    acc = DRGBColor(*hex2rgb(s["accent"]))
+    hbg = DRGBColor(*hex2rgb(s["header_bg"]))
+    hfg = DRGBColor(*hex2rgb(s["header_fg"]))
+    txt = DRGBColor(*hex2rgb(s["text"]))
+
     doc = Document()
-    doc.add_heading(plan["title"], level=0)
+    # Поля
+    for section in doc.sections:
+        section.top_margin = Cm(2)
+        section.bottom_margin = Cm(2)
+        section.left_margin = Cm(2.5)
+        section.right_margin = Cm(2.5)
+
+    # Заголовок документа
+    title_p = doc.add_paragraph()
+    title_p.paragraph_format.space_after = Pt(6)
+    run = title_p.add_run(plan["title"])
+    run.bold = True
+    run.font.size = Pt(22)
+    run.font.color.rgb = hfg
+    # Цвет фона параграфа заголовка через XML
+    pPr = title_p._p.get_or_add_pPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), s["header_bg"])
+    pPr.append(shd)
+
+    doc.add_paragraph()  # отступ
+
     for block in plan["content"]:
         t = block["type"]
         if t == "heading":
-            doc.add_heading(block["text"], level=1)
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(10)
+            p.paragraph_format.space_after = Pt(4)
+            # Левая граница — акцентный цвет
+            pPr = p._p.get_or_add_pPr()
+            pBdr = OxmlElement("w:pBdr")
+            left = OxmlElement("w:left")
+            left.set(qn("w:val"), "single")
+            left.set(qn("w:sz"), "24")
+            left.set(qn("w:space"), "8")
+            left.set(qn("w:color"), s["accent"])
+            pBdr.append(left)
+            pPr.append(pBdr)
+            run = p.add_run(block["text"])
+            run.bold = True
+            run.font.size = Pt(13)
+            run.font.color.rgb = acc
+
         elif t == "paragraph":
-            doc.add_paragraph(block["text"])
+            p = doc.add_paragraph(block["text"])
+            p.paragraph_format.space_after = Pt(6)
+            for run in p.runs:
+                run.font.size = Pt(11)
+                run.font.color.rgb = txt
+
         elif t == "bullets":
             for item in block["items"]:
-                doc.add_paragraph(item, style="List Bullet")
+                p = doc.add_paragraph(style="List Bullet")
+                run = p.add_run(item)
+                run.font.size = Pt(11)
+                run.font.color.rgb = txt
+
         elif t == "checklist":
             for item in block["items"]:
                 p = doc.add_paragraph()
-                p.add_run(f"[ ]  {item}").font.size = Pt(11)
+                # Цветной чекбокс
+                cb = p.add_run("☐  ")
+                cb.font.color.rgb = acc
+                cb.font.size = Pt(12)
+                run = p.add_run(item)
+                run.font.size = Pt(11)
+                run.font.color.rgb = txt
+
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
 
-def make_xlsx(plan: dict) -> bytes:
+# ── XLSX со стилями ───────────────────────────────────────────────────────
+def make_xlsx(plan, style_key="minimal"):
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, GradientFill
+    from openpyxl.styles.numbers import FORMAT_NUMBER_COMMA_SEPARATED1
+
+    s = STYLES[style_key]
     wb = Workbook()
     ws = wb.active
     ws.title = plan["title"][:30]
+
     c = plan["content"]
-    ws.append(c["headers"])
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="4472C4")
-    for row in c["rows"]:
-        ws.append(row)
+    headers = c["headers"]
+    rows = c["rows"]
+
+    # Заголовок листа
+    ws.merge_cells(f"A1:{chr(64+len(headers))}1")
+    title_cell = ws["A1"]
+    title_cell.value = plan["title"]
+    title_cell.font = Font(bold=True, size=14, color=s["header_fg"])
+    title_cell.fill = PatternFill("solid", fgColor=s["header_bg"])
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    # Шапка таблицы
+    thin = Side(style="thin", color=s["accent"])
+    border = Border(bottom=thin)
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=2, column=col, value=h)
+        cell.font = Font(bold=True, color=s["header_fg"])
+        cell.fill = PatternFill("solid", fgColor=s["accent"])
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    ws.row_dimensions[2].height = 22
+
+    # Данные с чередующимися строками
+    for r_idx, row in enumerate(rows, 3):
+        alt = r_idx % 2 == 0
+        fill_color = s["row_alt"] if alt else s["bg"]
+        for c_idx, val in enumerate(row, 1):
+            cell = ws.cell(row=r_idx, column=c_idx, value=val)
+            cell.fill = PatternFill("solid", fgColor=fill_color)
+            cell.font = Font(color=s["text"])
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        ws.row_dimensions[r_idx].height = 18
+
+    # Ширина столбцов
     for col in ws.columns:
-        width = max(len(str(cell.value or "")) for cell in col) + 3
-        ws.column_dimensions[col[0].column_letter].width = min(width, 50)
+        if col[0].row == 1:
+            continue
+        width = max(len(str(cell.value or "")) for cell in col) + 4
+        ws.column_dimensions[col[0].column_letter].width = min(width, 45)
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def make_csv(plan: dict) -> bytes:
+# ── CSV ───────────────────────────────────────────────────────────────────
+def make_csv(plan, style_key=None):
     import csv
     c = plan["content"]
     buf = io.StringIO()
@@ -247,35 +400,139 @@ def make_csv(plan: dict) -> bytes:
     return buf.getvalue().encode("utf-8-sig")
 
 
-def make_txt(plan: dict) -> bytes:
-    lines = [plan["title"], "=" * len(plan["title"]), ""]
+# ── TXT со стилями ────────────────────────────────────────────────────────
+def make_txt(plan, style_key="minimal"):
+    borders = {
+        "minimal": ("─", "│", "┌", "┐", "└", "┘"),
+        "business": ("═", "║", "╔", "╗", "╚", "╝"),
+        "creative": ("*", "|", "+", "+", "+", "+"),
+        "edu": ("-", "|", "+", "+", "+", "+"),
+    }
+    h, v, tl, tr, bl, br = borders.get(style_key, borders["minimal"])
+    w = 60
+    lines = []
+
+    # Рамка заголовка
+    lines.append(tl + h * (w - 2) + tr)
+    title = plan["title"]
+    pad = (w - 2 - len(title)) // 2
+    lines.append(v + " " * pad + title + " " * (w - 2 - pad - len(title)) + v)
+    lines.append(bl + h * (w - 2) + br)
+    lines.append("")
+
     for block in plan["content"]:
         t = block["type"]
         if t == "heading":
-            lines += ["", block["text"].upper(), "-" * len(block["text"])]
+            lines += ["", f"  {block['text'].upper()}", f"  {'─' * len(block['text'])}", ""]
         elif t == "paragraph":
-            lines += [block["text"], ""]
-        elif t in ("bullets", "checklist"):
-            mark = "[ ]" if t == "checklist" else "•"
-            lines += [f"  {mark} {i}" for i in block["items"]] + [""]
+            lines += [f"  {block['text']}", ""]
+        elif t == "bullets":
+            for item in block["items"]:
+                lines.append(f"  ► {item}")
+            lines.append("")
+        elif t == "checklist":
+            for item in block["items"]:
+                lines.append(f"  [ ] {item}")
+            lines.append("")
+
+    lines += ["", tl + h * (w - 2) + tr,
+              v + " Создано TG Doc Agent".center(w - 2) + v,
+              bl + h * (w - 2) + br]
     return "\n".join(lines).encode("utf-8")
 
 
-def make_pptx(plan: dict) -> bytes:
+# ── PPTX со стилями ───────────────────────────────────────────────────────
+def make_pptx(plan, style_key="minimal"):
     from pptx import Presentation
-    from pptx.util import Pt
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+
+    s = STYLES[style_key]
+    bg_rgb = RGBColor(*hex2rgb(s["bg"]))
+    hbg_rgb = RGBColor(*hex2rgb(s["header_bg"]))
+    hfg_rgb = RGBColor(*hex2rgb(s["header_fg"]))
+    acc_rgb = RGBColor(*hex2rgb(s["accent"]))
+    txt_rgb = RGBColor(*hex2rgb(s["text"]))
+
     prs = Presentation()
-    slide = prs.slides.add_slide(prs.slide_layouts[0])
-    slide.shapes.title.text = plan["title"]
-    for s in plan["content"]:
-        slide = prs.slides.add_slide(prs.slide_layouts[1])
-        slide.shapes.title.text = s["title"]
-        body = slide.placeholders[1].text_frame
-        body.clear()
-        for i, b in enumerate(s["bullets"]):
-            p = body.paragraphs[0] if i == 0 else body.add_paragraph()
-            p.text = b
-            p.font.size = Pt(20)
+    prs.slide_width = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+    W = prs.slide_width
+    H = prs.slide_height
+
+    def rect(slide, x, y, w, h, color, line=False):
+        shape = slide.shapes.add_shape(1, x, y, w, h)
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = color
+        if not line:
+            shape.line.fill.background()
+        return shape
+
+    def textbox(slide, x, y, w, h, text, bold=False, size=18, color=None, align=PP_ALIGN.LEFT):
+        tb = slide.shapes.add_textbox(x, y, w, h)
+        tf = tb.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.bold = bold
+        run.font.size = Pt(size)
+        if color:
+            run.font.color.rgb = color
+        return tb
+
+    slides_data = plan["content"]
+
+    # Титульный слайд
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.background.fill.solid()
+    slide.background.fill.fore_color.rgb = hbg_rgb
+    rect(slide, 0, int(H * 0.72), W, int(H * 0.28), acc_rgb)
+    textbox(slide, Inches(0.8), Inches(1.8), Inches(11.7), Inches(2.5),
+            plan["title"], bold=True, size=44, color=hfg_rgb)
+    if slides_data and slides_data[0].get("bullets"):
+        textbox(slide, Inches(0.8), Inches(4.3), Inches(10), Inches(0.9),
+                slides_data[0]["bullets"][0], size=20, color=acc_rgb)
+
+    # Контентные слайды
+    for i, s_data in enumerate(slides_data):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        slide.background.fill.solid()
+        slide.background.fill.fore_color.rgb = bg_rgb
+
+        # Шапка
+        rect(slide, 0, 0, W, Inches(1.3), hbg_rgb)
+        rect(slide, 0, 0, Inches(0.55), Inches(1.3), acc_rgb)
+        textbox(slide, Inches(0.05), Inches(0.25), Inches(0.45), Inches(0.8),
+                str(i + 1), bold=True, size=20, color=hfg_rgb, align=PP_ALIGN.CENTER)
+        textbox(slide, Inches(0.75), Inches(0.15), Inches(11.6), Inches(1.05),
+                s_data.get("title", ""), bold=True, size=26, color=hfg_rgb)
+
+        # Буллиты
+        bullets = s_data.get("bullets", [])
+        y0 = Inches(1.55)
+        h_each = Inches(0.9) if len(bullets) > 4 else Inches(1.05)
+        for j, b in enumerate(bullets[:6]):
+            y = y0 + j * h_each
+            rect(slide, Inches(0.48), y + Inches(0.2), Inches(0.16), Inches(0.16), acc_rgb)
+            textbox(slide, Inches(0.8), y, Inches(11.5), h_each, b, size=17, color=txt_rgb)
+
+        # Декор справа
+        rect(slide, W - Inches(0.22), Inches(1.3), Inches(0.22), H - Inches(1.3), acc_rgb)
+
+    # Финальный слайд
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.background.fill.solid()
+    slide.background.fill.fore_color.rgb = hbg_rgb
+    rect(slide, 0, 0, W, Inches(0.45), acc_rgb)
+    rect(slide, 0, H - Inches(0.45), W, Inches(0.45), acc_rgb)
+    textbox(slide, Inches(1), Inches(2.5), Inches(11.3), Inches(2),
+            "Спасибо!", bold=True, size=54, color=hfg_rgb, align=PP_ALIGN.CENTER)
+    textbox(slide, Inches(1), Inches(4.5), Inches(11.3), Inches(0.9),
+            plan["title"], size=20, color=acc_rgb, align=PP_ALIGN.CENTER)
+
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue()
@@ -286,98 +543,151 @@ GENERATORS = {
     "csv": make_csv, "txt": make_txt, "pptx": make_pptx,
 }
 
+# ── UI ────────────────────────────────────────────────────────────────────
+PENDING = {}  # {user_id: {"request": str, "fmt": str}}
+
 START_TEXT = (
-    "Привет! Я генерирую документы по твоему запросу 📄\n\n"
-    "Просто напиши, что нужно, например:\n"
-    "• «чек-лист запуска телеграм-канала в PDF»\n"
+    "Привет! Я создаю красивые документы 📄✨\n\n"
+    "Напиши запрос, например:\n"
+    "• «чек-лист запуска ТГ-канала»\n"
+    "• «гайд по prompt-инжинирингу»\n"
     "• «презентация про нейросети, 5 слайдов»\n"
-    "• «таблица учёта расходов в excel»\n"
-    "• «гайд по prompt-инжинирингу в ворде»\n\n"
-    "📎 Пришли мне свой файл-образец (.txt, .docx, .pdf) — "
-    "и я буду генерить документы в твоём стиле.\n\n"
-    "Команды:\n"
-    "/template — показать текущий образец\n"
-    "/clear — удалить образец"
+    "• «таблица учёта расходов»\n\n"
+    "📎 Пришли файл-образец (.txt, .docx, .pdf) — буду копировать стиль.\n\n"
+    "/template — текущий образец\n/clear — удалить образец"
 )
 
+FORMAT_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📊 Презентация", callback_data="fmt_pptx"),
+     InlineKeyboardButton("📄 PDF", callback_data="fmt_pdf")],
+    [InlineKeyboardButton("📝 Word", callback_data="fmt_docx"),
+     InlineKeyboardButton("📊 Excel", callback_data="fmt_xlsx")],
+    [InlineKeyboardButton("📋 CSV", callback_data="fmt_csv"),
+     InlineKeyboardButton("📃 TXT", callback_data="fmt_txt")],
+])
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(START_TEXT)
+STYLE_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🌊 Минимализм", callback_data="sty_minimal"),
+     InlineKeyboardButton("💎 Бизнес", callback_data="sty_business")],
+    [InlineKeyboardButton("🎨 Яркий", callback_data="sty_creative"),
+     InlineKeyboardButton("🌍 Образование", callback_data="sty_edu")],
+])
+
+# CSV не имеет стилей — сразу генерируем
+NO_STYLE_FMTS = {"csv"}
 
 
-async def cmd_template(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    t = get_template(update.effective_user.id)
-    if t:
-        await update.message.reply_text(f"Текущий образец (первые 500 символов):\n\n{t[:500]}")
-    else:
-        await update.message.reply_text("Образец не загружен. Пришли мне файл — я запомню его стиль.")
+# ── Handlers ──────────────────────────────────────────────────────────────
+async def cmd_start(u: Update, c): await u.message.reply_text(START_TEXT)
 
 
-async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_templates()
-    data.pop(str(update.effective_user.id), None)
+async def cmd_template(u: Update, c):
+    t = get_template(u.effective_user.id)
+    await u.message.reply_text(
+        f"Образец (первые 500 симв.):\n\n{t[:500]}" if t else "Образец не загружен. Пришли файл!"
+    )
+
+
+async def cmd_clear(u: Update, c):
+    d = load_templates()
+    d.pop(str(u.effective_user.id), None)
     with open(TEMPLATES_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    await update.message.reply_text("Образец удалён ✅")
+        json.dump(d, f, ensure_ascii=False)
+    await u.message.reply_text("Образец удалён ✅")
 
 
-def extract_text_from_file(filename: str, data: bytes) -> str:
+def extract_text(filename, data):
     name = filename.lower()
     if name.endswith((".txt", ".md", ".csv")):
         return data.decode("utf-8", errors="ignore")
     if name.endswith(".docx"):
         from docx import Document
-        doc = Document(io.BytesIO(data))
-        return "\n".join(p.text for p in doc.paragraphs)
+        return "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
     if name.endswith(".pdf"):
         try:
             from pypdf import PdfReader
-            reader = PdfReader(io.BytesIO(data))
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
-        except Exception:
-            return ""
+            return "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(data)).pages)
+        except: return ""
     return ""
 
 
-async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
+async def handle_document(u: Update, c):
+    doc = u.message.document
     if doc.file_size > 5 * 1024 * 1024:
-        await update.message.reply_text("Файл слишком большой (макс 5 МБ).")
+        await u.message.reply_text("Файл слишком большой (макс 5 МБ).")
         return
     f = await doc.get_file()
     data = bytes(await f.download_as_bytearray())
-    text = extract_text_from_file(doc.file_name or "", data)
+    text = extract_text(doc.file_name or "", data)
     if not text.strip():
-        await update.message.reply_text("Не смог прочитать файл 😕 Поддерживаю: .txt, .md, .docx, .pdf, .csv")
+        await u.message.reply_text("Не смог прочитать 😕 Жду: .txt, .md, .docx, .pdf, .csv")
         return
-    save_template(update.effective_user.id, text)
-    await update.message.reply_text("Образец сохранён ✅ Теперь буду генерить документы в этом стиле.\nНапиши, что создать!")
+    save_template(u.effective_user.id, text)
+    await u.message.reply_text("Образец сохранён ✅ Напиши что создать!")
 
 
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    await msg.chat.send_action("upload_document")
-    status = await msg.reply_text("⏳ Генерирую документ...")
+async def handle_text(u: Update, c):
+    uid = u.effective_user.id
+    PENDING[uid] = {"request": u.message.text, "fmt": None}
+    await u.message.reply_text(
+        f"📋 *{u.message.text[:80]}*\n\nВыбери формат:",
+        parse_mode="Markdown",
+        reply_markup=FORMAT_KB,
+    )
+
+
+async def handle_callback(u: Update, c):
+    q = u.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    data = q.data
+
+    if data.startswith("fmt_"):
+        fmt = data[4:]
+        p = PENDING.get(uid)
+        if not p:
+            await q.edit_message_text("Сессия истекла. Напиши запрос заново."); return
+        p["fmt"] = fmt
+
+        if fmt in NO_STYLE_FMTS:
+            await q.edit_message_text(f"⏳ Генерирую {fmt.upper()}...")
+            await _gen(q, uid, fmt, None)
+        else:
+            fmt_names = {"pptx": "Презентацию", "pdf": "PDF", "docx": "Word",
+                         "xlsx": "Excel", "txt": "TXT"}
+            await q.edit_message_text(
+                f"✅ Формат: {fmt_names.get(fmt, fmt)}\n\nВыбери стиль:",
+                reply_markup=STYLE_KB,
+            )
+
+    elif data.startswith("sty_"):
+        style_key = data[4:]
+        p = PENDING.get(uid)
+        if not p:
+            await q.edit_message_text("Сессия истекла. Напиши запрос заново."); return
+        fmt = p.get("fmt", "pdf")
+        style_name = STYLES[style_key]["name"]
+        await q.edit_message_text(f"⏳ Генерирую {fmt.upper()} в стиле {style_name}...")
+        await _gen(q, uid, fmt, style_key)
+
+
+async def _gen(q, uid, fmt, style_key):
+    p = PENDING.get(uid, {})
     try:
-        template = get_template(update.effective_user.id)
-        plan = plan_document(msg.text, template)
-        fmt = plan.get("format", "pdf")
-        if fmt not in GENERATORS:
-            fmt = "pdf"
-        file_bytes = GENERATORS[fmt](plan)
+        plan = plan_document(p.get("request", ""), get_template(uid))
+        plan["format"] = fmt
+        file_bytes = GENERATORS[fmt](plan, style_key or "minimal")
         filename = f"{plan.get('filename', 'document')}.{fmt}"
-        await msg.reply_document(
+        style_label = f" [{STYLES[style_key]['name']}]" if style_key else ""
+        await q.message.reply_document(
             document=io.BytesIO(file_bytes),
             filename=filename,
-            caption=f"✅ {plan.get('title', 'Готово')}",
+            caption=f"✅ {plan.get('title', 'Готово')}{style_label}",
         )
-        await status.delete()
+        PENDING.pop(uid, None)
     except Exception as e:
-        log.exception("generation failed")
-        err = str(e)
-        if "key=" in err:  # на всякий случай вырезаем ключ из любых ошибок
-            err = err.split("key=")[0] + "key=***"
-        await status.edit_text(f"Ошибка генерации 😞 Попробуй ещё раз через минуту.\n({err[:200]})")
+        log.exception("gen failed")
+        await q.message.reply_text(f"Ошибка 😞 Попробуй переформулировать.\n({str(e)[:200]})")
 
 
 def main():
@@ -387,17 +697,15 @@ def main():
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
     if WEBHOOK_URL:
-        log.info("Starting in WEBHOOK mode on port %s", PORT)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-        )
+        log.info("Webhook mode port %s", PORT)
+        app.run_webhook(listen="0.0.0.0", port=PORT,
+                        url_path=BOT_TOKEN,
+                        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
     else:
-        log.info("Starting in POLLING mode")
+        log.info("Polling mode")
         app.run_polling(drop_pending_updates=True)
 
 
