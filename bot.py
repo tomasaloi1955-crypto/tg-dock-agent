@@ -136,24 +136,89 @@ PLAN_SYSTEM = """Ты — генератор документов. Верни Т
  "title": "Заголовок",
  "content": ...
 }
-Формат: презентация/слайды→pptx, таблица/данные→xlsx/csv, гайд/чек-лист/инструкция→pdf, ворд→docx, текст→txt
-Content:
-- pdf/docx/txt: [{"type":"heading","text":"..."},{"type":"paragraph","text":"..."},{"type":"bullets","items":["..."]},{"type":"checklist","items":["..."]}]
-- xlsx/csv: {"headers":["..."],"rows":[["..."]]}
-- pptx: [{"title":"...","bullets":["...","..."]}]
-Делай контент содержательным и полным. Для pptx — минимум 5 слайдов.
-Если есть ОБРАЗЕЦ — копируй его структуру и стиль."""
+
+ФОРМАТ — определяй по запросу:
+- презентация/слайды → pptx
+- таблица/данные/учёт → xlsx или csv
+- гайд/чек-лист/инструкция → pdf
+- ворд/word/документ → docx
+- заметка/текст → txt
+
+КОЛИЧЕСТВО СТРАНИЦ/СЛАЙДОВ — СТРОГО из запроса:
+- Если сказано "20 слайдов" → ровно 20 слайдов
+- Если сказано "100 страниц" → 100 страниц/секций
+- Если сказано "5 листов" → 5 слайдов
+- Если число не указано → pptx минимум 7 слайдов, pdf/docx минимум 3 раздела
+- НИКОГДА не делай меньше чем просит пользователь
+
+ОБЪЁМ КОНТЕНТА — делай полным и насыщенным:
+- Каждый слайд pptx: заголовок + 3-5 содержательных буллита (не однословных!)
+- Каждый раздел pdf/docx: заголовок + 2-3 абзаца или 5-8 пунктов списка
+- Таблицы: минимум 10 строк данных если не указано иное
+
+ШРИФТЫ/СТИЛЬ — если юзер указал ("жирный", "крупный", "Arial") — запомни в title как "(шрифт: Arial, крупный)"
+
+Content по формату:
+- pdf/docx/txt: [{"type":"heading","text":"..."},{"type":"paragraph","text":"..."},{"type":"bullets","items":["...","...","...","...","..."]},{"type":"checklist","items":["...","...","..."]}]
+- xlsx/csv: {"headers":["..."],"rows":[["..."],["..."],...]}
+- pptx: [{"title":"Заголовок слайда","bullets":["Подробный пункт 1","Подробный пункт 2","Подробный пункт 3","Пункт 4","Пункт 5"]}]
+
+ВАЖНО: если просят 20 слайдов — в массиве content должно быть РОВНО 20 объектов. Считай!
+Если есть ОБРАЗЕЦ — копируй его структуру, стиль и объём."""
+
+
+def extract_count(text):
+    """Извлекаем нужное количество страниц/слайдов из запроса."""
+    import re
+    patterns = [
+        r'(\d+)\s*слайд', r'(\d+)\s*лист', r'(\d+)\s*страниц',
+        r'(\d+)\s*slide', r'(\d+)\s*page', r'на\s+(\d+)',
+    ]
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def plan_document(user_request, template=""):
     prompt = user_request
     if template:
         prompt += f"\n\n--- ОБРАЗЕЦ ---\n{template}"
+
+    # Первый запрос
     raw = llm(prompt, PLAN_SYSTEM).strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         raw = raw[4:] if raw.startswith("json") else raw
-    return json.loads(raw.strip())
+    plan = json.loads(raw.strip())
+
+    # Проверяем количество слайдов/страниц
+    needed = extract_count(user_request)
+    if needed and isinstance(plan.get("content"), list):
+        got = len(plan["content"])
+        if got < needed:
+            log.info("Got %d items, need %d — requesting more", got, needed)
+            # Просим догенерировать недостающее
+            extra_prompt = (
+                f"Продолжи презентацию/документ '{plan['title']}'. "
+                f"Уже есть {got} слайдов/разделов, нужно ещё {needed - got}. "
+                f"Верни ТОЛЬКО JSON-массив с {needed - got} новыми элементами того же формата: "
+                f"{json.dumps(plan['content'][:2], ensure_ascii=False)}"
+            )
+            try:
+                extra_raw = llm(extra_prompt).strip()
+                if extra_raw.startswith("```"):
+                    extra_raw = extra_raw.split("```")[1]
+                    extra_raw = extra_raw[4:] if extra_raw.startswith("json") else extra_raw
+                extra = json.loads(extra_raw.strip())
+                if isinstance(extra, list):
+                    plan["content"].extend(extra)
+                    log.info("Extended to %d items", len(plan["content"]))
+            except Exception as e:
+                log.warning("Could not extend content: %s", e)
+
+    return plan
 
 
 # ── PDF со стилями ────────────────────────────────────────────────────────
@@ -558,22 +623,28 @@ START_TEXT = (
 )
 
 FORMAT_KB = InlineKeyboardMarkup([
-    [InlineKeyboardButton("📊 Презентация", callback_data="fmt_pptx"),
+    [InlineKeyboardButton("📊 Презентация PPTX", callback_data="fmt_pptx"),
      InlineKeyboardButton("📄 PDF", callback_data="fmt_pdf")],
-    [InlineKeyboardButton("📝 Word", callback_data="fmt_docx"),
-     InlineKeyboardButton("📊 Excel", callback_data="fmt_xlsx")],
+    [InlineKeyboardButton("📝 Word DOCX", callback_data="fmt_docx"),
+     InlineKeyboardButton("📊 Excel XLSX", callback_data="fmt_xlsx")],
     [InlineKeyboardButton("📋 CSV", callback_data="fmt_csv"),
      InlineKeyboardButton("📃 TXT", callback_data="fmt_txt")],
 ])
 
-STYLE_KB = InlineKeyboardMarkup([
+PPTX_STYLE_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🌊 Тёмный Бирюза", callback_data="sty_dark_teal"),
+     InlineKeyboardButton("👑 Фиолет & Золото", callback_data="sty_purple_gold")],
+    [InlineKeyboardButton("🌸 Коралл & Нави", callback_data="sty_coral_navy"),
+     InlineKeyboardButton("🌿 Лесной", callback_data="sty_forest")],
+    [InlineKeyboardButton("🌹 Роуз Голд", callback_data="sty_rose_gold")],
+])
+
+DOC_STYLE_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("🌊 Минимализм", callback_data="sty_minimal"),
      InlineKeyboardButton("💎 Бизнес", callback_data="sty_business")],
     [InlineKeyboardButton("🎨 Яркий", callback_data="sty_creative"),
      InlineKeyboardButton("🌍 Образование", callback_data="sty_edu")],
 ])
-
-# CSV не имеет стилей — сразу генерируем
 NO_STYLE_FMTS = {"csv"}
 
 
@@ -652,14 +723,19 @@ async def handle_callback(u: Update, c):
         if fmt in NO_STYLE_FMTS:
             await q.edit_message_text(f"⏳ Генерирую {fmt.upper()}...")
             await _gen(q, uid, fmt, None)
-        else:
-            fmt_names = {"pptx": "Презентацию", "pdf": "PDF", "docx": "Word",
-                         "xlsx": "Excel", "txt": "TXT"}
+        elif fmt == "pptx":
             await q.edit_message_text(
-                f"✅ Формат: {fmt_names.get(fmt, fmt)}\n\nВыбери стиль:",
-                reply_markup=STYLE_KB,
+                "✅ Формат: Презентация PPTX\n\n"
+                "🎨 Шаг 2 из 2 — выбери цветовую тему:",
+                reply_markup=PPTX_STYLE_KB,
             )
-
+        else:
+            fmt_names = {"pdf": "PDF", "docx": "Word", "xlsx": "Excel", "txt": "TXT"}
+            await q.edit_message_text(
+                f"✅ Формат: {fmt_names.get(fmt, fmt)}\n\n"
+                "🎨 Шаг 2 из 2 — выбери стиль оформления:",
+                reply_markup=DOC_STYLE_KB,
+            )
     elif data.startswith("sty_"):
         style_key = data[4:]
         p = PENDING.get(uid)
@@ -676,9 +752,14 @@ async def _gen(q, uid, fmt, style_key):
     try:
         plan = plan_document(p.get("request", ""), get_template(uid))
         plan["format"] = fmt
-        file_bytes = GENERATORS[fmt](plan, style_key or "minimal")
+        default = "dark_teal" if fmt == "pptx" else "minimal"
+        file_bytes = GENERATORS[fmt](plan, style_key or default)
         filename = f"{plan.get('filename', 'document')}.{fmt}"
-        style_label = f" [{STYLES[style_key]['name']}]" if style_key else ""
+        if style_key:
+            all_themes = {**STYLES, **PPTX_THEMES}
+            style_label = f" [{all_themes.get(style_key, {}).get('name', style_key)}]"
+        else:
+            style_label = ""
         await q.message.reply_document(
             document=io.BytesIO(file_bytes),
             filename=filename,
